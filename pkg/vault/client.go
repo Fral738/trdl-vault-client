@@ -3,6 +3,7 @@ package vault
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/vault/api"
@@ -22,6 +23,28 @@ type TrdlClient struct {
 	vaultToken  string
 	retry       bool
 	maxDelay    time.Duration
+}
+
+type operationContext struct {
+	contextCancelled      bool
+	watchTaskLogsActive   bool
+	watchTaskStatusActive bool
+	trdlTaskStatus        *TrdlTaskStatus
+	err                   error
+}
+
+type TrdlTaskStatus struct {
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+func newOperationContext() *operationContext {
+	return &operationContext{
+		contextCancelled:      false,
+		watchTaskLogsActive:   false,
+		watchTaskStatusActive: false,
+		trdlTaskStatus:        nil,
+	}
 }
 
 func NewTrdlClient(opts TrdlClientOptions) (*TrdlClient, error) {
@@ -82,28 +105,60 @@ func (c *TrdlClient) withBackoffRequest(
 	return fmt.Errorf("%s operation exceeded maximum duration", path)
 }
 
-func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger) error {
-	taskLogger(taskID, fmt.Sprintf("Started publish task %s", taskID))
+func (c *TrdlClient) gracefulShutdown(ctx *operationContext) {
+	ctx.contextCancelled = true
 
 	for {
-		status, reason, err := c.getTaskStatus(projectName, taskID)
-		if err != nil {
-			return fmt.Errorf("error getting task %s status: %w", taskID, err)
+		if !ctx.watchTaskStatusActive && !ctx.watchTaskLogsActive {
+			return
 		}
-
-		if status == "FAILED" {
-			logs, _ := c.getTaskLogs(projectName, taskID)
-			taskLogger(taskID, logs)
-			return fmt.Errorf("task %s failed: %s", taskID, reason)
-		}
-
-		if status == "SUCCEEDED" {
-			logs, _ := c.getTaskLogs(projectName, taskID)
-			taskLogger(taskID, logs)
-			return nil
-		}
-
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// watchTask monitors the status and logs of a task
+func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger) error {
+	taskLogger(taskID, fmt.Sprintf("Started task %s", taskID))
+
+	ctx := newOperationContext()
+
+	errChan := make(chan error, 2)
+
+	go func() {
+		if err := c.watchTaskStatus(ctx, projectName, taskID); err != nil {
+			errChan <- fmt.Errorf("error watching task %s status: %w", taskID, err)
+		}
+	}()
+
+	go func() {
+		if err := c.watchTaskLogs(ctx, projectName, taskID, taskLogger); err != nil {
+			errChan <- fmt.Errorf("error watching task %s logs: %w", taskID, err)
+		}
+	}()
+
+	// Ожидание завершения таски или ошибки
+	for {
+		select {
+		case err := <-errChan:
+			// Ошибка в одной из горутин
+			c.gracefulShutdown(ctx)
+			taskLogger(taskID, fmt.Sprintf("[ERROR] %s", err))
+			return err
+
+		default:
+			if ctx.trdlTaskStatus != nil {
+				switch ctx.trdlTaskStatus.Status {
+				case "FAILED":
+					c.gracefulShutdown(ctx)
+					return fmt.Errorf("task %s failed: %s", taskID, ctx.trdlTaskStatus.Reason)
+
+				case "SUCCEEDED":
+					c.gracefulShutdown(ctx)
+					return nil
+				}
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 	}
 }
 
@@ -137,4 +192,86 @@ func (c *TrdlClient) getTaskLogs(projectName, taskID string) (string, error) {
 
 	logs, _ := resp.Data["result"].(string)
 	return logs, nil
+}
+
+func (c *TrdlClient) Release(projectName, gitTag string, taskLogger TaskLogger) error {
+	return c.withBackoffRequest(
+		fmt.Sprintf("v1/%s/release", projectName),
+		map[string]interface{}{"git_tag": gitTag},
+		taskLogger,
+		func(taskID string, taskLogger TaskLogger) error {
+			return c.watchTask(projectName, taskID, taskLogger)
+		},
+	)
+}
+
+// watchTaskStatus periodically fetches task status and updates context
+func (c *TrdlClient) watchTaskStatus(ctx *operationContext, projectName, taskID string) error {
+	ctx.watchTaskStatusActive = true
+	defer func() { ctx.watchTaskStatusActive = false }()
+
+	for {
+		if ctx.contextCancelled {
+			break
+		}
+
+		resp, err := c.vaultClient.Logical().Read(fmt.Sprintf("v1/%s/task/%s", projectName, taskID))
+		if err != nil {
+			return fmt.Errorf("failed to get task status: %w", err)
+		}
+
+		if resp == nil || resp.Data == nil {
+			return fmt.Errorf("task %s status response is empty", taskID)
+		}
+
+		status, ok := resp.Data["status"].(string)
+		if !ok {
+			return fmt.Errorf("unexpected response format for task %s status", taskID)
+		}
+
+		ctx.trdlTaskStatus = &TrdlTaskStatus{
+			Status: status,
+			Reason: resp.Data["reason"].(string),
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+	return nil
+}
+
+// watchTaskLogs fetches logs in a loop
+func (c *TrdlClient) watchTaskLogs(ctx *operationContext, projectName, taskID string, taskLogger TaskLogger) error {
+	ctx.watchTaskLogsActive = true
+	defer func() { ctx.watchTaskLogsActive = false }()
+
+	cursor := 0
+	for {
+		if ctx.contextCancelled {
+			break
+		}
+
+		resp, err := c.vaultClient.Logical().ReadWithData(
+			fmt.Sprintf("v1/%s/task/%s/log", projectName, taskID),
+			map[string][]string{"qs": {"limit=1000000000", fmt.Sprintf("offset=%d", cursor)}},
+		)
+		if err != nil {
+			return fmt.Errorf("failed to fetch logs for task %s: %w", taskID, err)
+		}
+
+		if resp == nil || resp.Data == nil {
+			return fmt.Errorf("empty logs response for task %s", taskID)
+		}
+
+		logs, ok := resp.Data["result"].(string)
+		if ok && len(logs) > 0 {
+			logLines := strings.Split(strings.TrimSpace(logs), "\n")
+			for _, line := range logLines {
+				taskLogger(taskID, line)
+			}
+			cursor += len(logs)
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+	return nil
 }
