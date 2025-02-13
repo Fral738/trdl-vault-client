@@ -66,7 +66,7 @@ func NewTrdlClient(opts TrdlClientOptions) (*TrdlClient, error) {
 
 func (c *TrdlClient) Publish(projectName string, taskLogger TaskLogger) error {
 	return c.withBackoffRequest(
-		fmt.Sprintf("v1/%s/publish", projectName),
+		fmt.Sprintf("%s/publish", projectName),
 		nil,
 		taskLogger,
 		func(taskID string, taskLogger TaskLogger) error {
@@ -136,11 +136,9 @@ func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger
 		}
 	}()
 
-	// Ожидание завершения таски или ошибки
 	for {
 		select {
 		case err := <-errChan:
-			// Ошибка в одной из горутин
 			c.gracefulShutdown(ctx)
 			taskLogger(taskID, fmt.Sprintf("[ERROR] %s", err))
 			return err
@@ -163,7 +161,7 @@ func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger
 }
 
 func (c *TrdlClient) getTaskStatus(projectName, taskID string) (string, string, error) {
-	path := fmt.Sprintf("v1/%s/task/%s", projectName, taskID)
+	path := fmt.Sprintf("%s/task/%s", projectName, taskID)
 	resp, err := c.vaultClient.Logical().Read(path)
 	if err != nil {
 		return "", "", err
@@ -180,7 +178,7 @@ func (c *TrdlClient) getTaskStatus(projectName, taskID string) (string, string, 
 }
 
 func (c *TrdlClient) getTaskLogs(projectName, taskID string) (string, error) {
-	path := fmt.Sprintf("v1/%s/task/%s/log?limit=0", projectName, taskID)
+	path := fmt.Sprintf("%s/task/%s/log?limit=0", projectName, taskID)
 	resp, err := c.vaultClient.Logical().Read(path)
 	if err != nil {
 		return "", err
@@ -196,7 +194,7 @@ func (c *TrdlClient) getTaskLogs(projectName, taskID string) (string, error) {
 
 func (c *TrdlClient) Release(projectName, gitTag string, taskLogger TaskLogger) error {
 	return c.withBackoffRequest(
-		fmt.Sprintf("v1/%s/release", projectName),
+		fmt.Sprintf("%s/release", projectName),
 		map[string]interface{}{"git_tag": gitTag},
 		taskLogger,
 		func(taskID string, taskLogger TaskLogger) error {
@@ -215,27 +213,37 @@ func (c *TrdlClient) watchTaskStatus(ctx *operationContext, projectName, taskID 
 			break
 		}
 
-		resp, err := c.vaultClient.Logical().Read(fmt.Sprintf("v1/%s/task/%s", projectName, taskID))
+		resp, err := c.vaultClient.Logical().Read(fmt.Sprintf("%s/task/%s", projectName, taskID))
 		if err != nil {
-			return fmt.Errorf("failed to get task status: %w", err)
+			return fmt.Errorf("failed to fetch status for task %s: %w", taskID, err)
 		}
 
+		log.Printf("[DEBUG] Task %s status response: %+v", taskID, resp)
+
 		if resp == nil || resp.Data == nil {
-			return fmt.Errorf("task %s status response is empty", taskID)
+			log.Printf("[INFO] No status yet for task %s, retrying...", taskID)
+			time.Sleep(500 * time.Millisecond)
+			continue
 		}
 
 		status, ok := resp.Data["status"].(string)
 		if !ok {
-			return fmt.Errorf("unexpected response format for task %s status", taskID)
+			log.Printf("[ERROR] Unexpected status format for task %s: %+v", taskID, resp.Data)
+			time.Sleep(500 * time.Millisecond)
+			continue
 		}
 
-		ctx.trdlTaskStatus = &TrdlTaskStatus{
-			Status: status,
-			Reason: resp.Data["reason"].(string),
+		if status == "FAILED" {
+			return fmt.Errorf("trdl task %s has failed: %v", taskID, resp.Data["reason"])
+		}
+
+		if status == "SUCCEEDED" {
+			return nil
 		}
 
 		time.Sleep(500 * time.Millisecond)
 	}
+
 	return nil
 }
 
@@ -250,28 +258,48 @@ func (c *TrdlClient) watchTaskLogs(ctx *operationContext, projectName, taskID st
 			break
 		}
 
+		data := map[string][]string{
+			"limit":  {"1000000000"},
+			"offset": {fmt.Sprintf("%d", cursor)},
+		}
+
 		resp, err := c.vaultClient.Logical().ReadWithData(
-			fmt.Sprintf("v1/%s/task/%s/log", projectName, taskID),
-			map[string][]string{"qs": {"limit=1000000000", fmt.Sprintf("offset=%d", cursor)}},
+			fmt.Sprintf("%s/task/%s/log", projectName, taskID),
+			data,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to fetch logs for task %s: %w", taskID, err)
 		}
 
+		log.Printf("[DEBUG] Task %s logs response: %+v", taskID, resp)
+
 		if resp == nil || resp.Data == nil {
-			return fmt.Errorf("empty logs response for task %s", taskID)
+			log.Printf("[INFO] No logs yet for task %s, retrying...", taskID)
+			time.Sleep(500 * time.Millisecond)
+			continue
 		}
 
 		logs, ok := resp.Data["result"].(string)
-		if ok && len(logs) > 0 {
-			logLines := strings.Split(strings.TrimSpace(logs), "\n")
-			for _, line := range logLines {
-				taskLogger(taskID, line)
-			}
-			cursor += len(logs)
+		if !ok {
+			log.Printf("[ERROR] Unexpected log format for task %s: %+v", taskID, resp.Data)
+			time.Sleep(500 * time.Millisecond)
+			continue
 		}
 
+		if len(logs) == 0 {
+			log.Printf("[INFO] Empty logs for task %s, retrying...", taskID)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		logLines := strings.Split(strings.TrimSpace(logs), "\n")
+		for _, line := range logLines {
+			taskLogger(taskID, line)
+		}
+
+		cursor += len(logs)
 		time.Sleep(500 * time.Millisecond)
 	}
+
 	return nil
 }
