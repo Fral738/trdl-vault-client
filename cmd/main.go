@@ -2,9 +2,13 @@ package main
 
 import (
 	"log"
+	"net/http"
 	"os"
+	"time"
 
 	"trdl-vault-client/pkg/vault"
+
+	"github.com/hashicorp/vault/api"
 )
 
 func main() {
@@ -13,12 +17,13 @@ func main() {
 	projectName := os.Getenv("TRDL_RELEASE_PROJECT_NAME")
 	gitTag := os.Getenv("TRDL_GIT_TAG")
 
-	client, err := vault.NewTrdlClient(vault.TrdlClientOptions{
-		VaultAddr:   vaultAddr,
-		VaultToken:  vaultToken,
-		Retry:       true,
-		MaxDelaySec: 300,
-	})
+	config := &api.Config{
+		Address:    vaultAddr,
+		Timeout:    60 * time.Second,
+		HttpClient: &http.Client{Timeout: 60 * time.Second},
+	}
+
+	client, err := vault.NewTrdlClient(config, vaultToken)
 	if err != nil {
 		log.Fatalf("Error: %v", err)
 	}
