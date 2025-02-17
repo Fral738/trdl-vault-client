@@ -3,8 +3,8 @@ package vault
 import (
 	"fmt"
 	"os"
-	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/hashicorp/vault/api"
 )
 
@@ -71,31 +71,41 @@ func (c *TrdlClient) Release(projectName, gitTag string, taskLogger TaskLogger) 
 func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger) error {
 	taskLogger(taskID, fmt.Sprintf("Started task %s", taskID))
 
-	timeout := time.After(2 * time.Minute)
-	ticker := time.NewTicker(10 * time.Second)
-
-	for {
-		select {
-		case <-timeout:
-			return fmt.Errorf("task %s timed out", taskID)
-		case <-ticker.C:
-			status, reason, err := c.getTaskStatus(projectName, taskID)
-			if err != nil {
-				return err
-			}
-
-			switch status {
-			case "RUNNING":
-				taskLogger(taskID, fmt.Sprintf("Task %s is still running...", taskID))
-			case "FAILED":
-				_ = c.getTaskLogs(projectName, taskID, taskLogger)
-				return fmt.Errorf("task %s failed: %s", taskID, reason)
-			case "SUCCEEDED":
-				_ = c.getTaskLogs(projectName, taskID, taskLogger)
-				return nil
-			}
+	// Backoff strategy for retrying failed operations
+	operation := func() error {
+		status, reason, err := c.getTaskStatus(projectName, taskID)
+		if err != nil {
+			return err
 		}
+
+		switch status {
+		case "RUNNING":
+			taskLogger(taskID, fmt.Sprintf("Task %s is still running...", taskID))
+		case "FAILED":
+			// Log the reason for failure
+			taskLogger(taskID, fmt.Sprintf("Task %s failed: %s", taskID, reason))
+
+			// Retry on certain errors (e.g., signature verification failure)
+			if reason == "signature verification failed" {
+				taskLogger(taskID, "Retrying due to signature verification failure...")
+				return fmt.Errorf("retrying...")
+			}
+			_ = c.getTaskLogs(projectName, taskID, taskLogger)
+			return fmt.Errorf("task %s failed: %s", taskID, reason)
+		case "SUCCEEDED":
+			_ = c.getTaskLogs(projectName, taskID, taskLogger)
+			return nil
+		}
+		return nil
 	}
+
+	// Use exponential backoff for retrying the operation
+	err := backoff.Retry(operation, backoff.NewExponentialBackOff())
+	if err != nil {
+		return fmt.Errorf("task %s failed after retries: %w", taskID, err)
+	}
+
+	return nil
 }
 
 // getTaskStatus retrieves the status of the task
@@ -128,7 +138,6 @@ func (c *TrdlClient) getTaskLogs(projectName, taskID string, taskLogger TaskLogg
 	if !ok || logs == "" {
 		return nil
 	}
-
 	taskLogger(taskID, logs)
 	return nil
 }
