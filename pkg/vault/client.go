@@ -3,6 +3,7 @@ package vault
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/hashicorp/vault/api"
@@ -70,7 +71,7 @@ func (c *TrdlClient) Release(projectName, gitTag string, taskLogger TaskLogger) 
 // watchTask waits for the task to finish and handles status changes
 func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger) error {
 	taskLogger(taskID, fmt.Sprintf("Started task %s", taskID))
-
+	time.Sleep(5 * time.Second)
 	// Backoff strategy for retrying failed operations
 	operation := func() error {
 		status, reason, err := c.getTaskStatus(projectName, taskID)
@@ -78,28 +79,25 @@ func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger
 			return err
 		}
 
+		taskLogger(taskID, fmt.Sprintf("Current status of task %s: %s", taskID, status))
+
 		switch status {
 		case "RUNNING":
 			taskLogger(taskID, fmt.Sprintf("Task %s is still running...", taskID))
+			return nil
 		case "FAILED":
-			// Log the reason for failure
 			taskLogger(taskID, fmt.Sprintf("Task %s failed: %s", taskID, reason))
-
-			// Retry on certain errors (e.g., signature verification failure)
-			if reason == "signature verification failed" {
-				taskLogger(taskID, "Retrying due to signature verification failure...")
-				return fmt.Errorf("retrying...")
-			}
 			_ = c.getTaskLogs(projectName, taskID, taskLogger)
 			return fmt.Errorf("task %s failed: %s", taskID, reason)
 		case "SUCCEEDED":
 			_ = c.getTaskLogs(projectName, taskID, taskLogger)
 			return nil
+		default:
+			taskLogger(taskID, fmt.Sprintf("Unknown status: %s", status))
+			return nil
 		}
-		return nil
 	}
 
-	// Use exponential backoff for retrying the operation
 	err := backoff.Retry(operation, backoff.NewExponentialBackOff())
 	if err != nil {
 		return fmt.Errorf("task %s failed after retries: %w", taskID, err)
