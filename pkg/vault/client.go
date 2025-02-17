@@ -160,15 +160,8 @@ func (c *TrdlClient) watchTaskStatus(projectName, taskID string) error {
 func (c *TrdlClient) watchTaskLogs(projectName, taskID string, taskLogger TaskLogger) error {
 	cursor := 0
 	for {
-		data := map[string][]string{
-			"limit":  {"1000000000"},
-			"offset": {fmt.Sprintf("%d", cursor)},
-		}
-
-		resp, err := c.vaultClient.Logical().ReadWithData(
-			fmt.Sprintf("%s/task/%s/log", projectName, taskID),
-			data,
-		)
+		resp, err := c.vaultClient.Logical().Read(
+			fmt.Sprintf("%s/task/%s/log", projectName, taskID))
 		if err != nil {
 			return fmt.Errorf("failed to fetch logs for task %s: %w", taskID, err)
 		}
