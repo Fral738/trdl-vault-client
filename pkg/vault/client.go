@@ -71,8 +71,13 @@ func (c *TrdlClient) Release(projectName, gitTag string, taskLogger TaskLogger) 
 // watchTask waits for the task to finish and handles status changes
 func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger) error {
 	taskLogger(taskID, fmt.Sprintf("Started task %s", taskID))
-	time.Sleep(5 * time.Second)
-	// Backoff strategy for retrying failed operations
+
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = 2 * time.Second
+	bo.MaxInterval = 30 * time.Second
+	bo.MaxElapsedTime = 5 * time.Minute
+	bo.Multiplier = 2
+
 	operation := func() error {
 		status, reason, err := c.getTaskStatus(projectName, taskID)
 		if err != nil {
@@ -98,7 +103,7 @@ func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger
 		}
 	}
 
-	err := backoff.Retry(operation, backoff.NewExponentialBackOff())
+	err := backoff.Retry(operation, bo)
 	if err != nil {
 		return fmt.Errorf("task %s failed after retries: %w", taskID, err)
 	}
