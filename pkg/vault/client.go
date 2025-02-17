@@ -33,63 +33,77 @@ func NewTrdlClient(vaultToken string) (*TrdlClient, error) {
 	return &TrdlClient{vaultClient: client}, nil
 }
 
+func (c *TrdlClient) withBackoffRequest(
+	path string,
+	data map[string]interface{},
+	taskLogger TaskLogger,
+	action func(taskID string, taskLogger TaskLogger) error,
+) error {
+	bo := backoff.NewExponentialBackOff()
+	bo.InitialInterval = 1 * time.Minute
+	bo.MaxInterval = 10 * time.Minute
+	bo.MaxElapsedTime = 30 * time.Minute
+	bo.Multiplier = 2
+
+	operation := func() error {
+		resp, err := c.vaultClient.Logical().Write(path, data)
+		if err != nil {
+			taskLogger("", fmt.Sprintf("[ERROR] %v", err))
+			return err
+		}
+
+		taskID, ok := resp.Data["task_uuid"].(string)
+		if !ok {
+			return fmt.Errorf("invalid response from Vault: missing task_uuid")
+		}
+
+		return action(taskID, taskLogger)
+	}
+
+	if err := backoff.Retry(operation, bo); err != nil {
+		return fmt.Errorf("%s operation exceeded maximum duration: %w", path, err)
+	}
+
+	return nil
+}
+
 // Publish sends a publish request to Vault
 func (c *TrdlClient) Publish(projectName string, taskLogger TaskLogger) error {
-	path := fmt.Sprintf("%s/publish", projectName)
-
-	resp, err := c.vaultClient.Logical().Write(path, nil)
-	if err != nil {
-		return fmt.Errorf("failed to start publish task: %w", err)
-	}
-
-	taskID, ok := resp.Data["task_uuid"].(string)
-	if !ok {
-		return fmt.Errorf("invalid response from Vault: missing task_uuid")
-	}
-
-	return c.watchTask(projectName, taskID, taskLogger)
+	return c.withBackoffRequest(
+		fmt.Sprintf("%s/publish", projectName),
+		nil,
+		taskLogger,
+		func(taskID string, taskLogger TaskLogger) error {
+			return c.watchTask(projectName, taskID, taskLogger)
+		},
+	)
 }
 
 // Release sends a release request to Vault
 func (c *TrdlClient) Release(projectName, gitTag string, taskLogger TaskLogger) error {
-	path := fmt.Sprintf("%s/release", projectName)
-	data := map[string]interface{}{"git_tag": gitTag}
-
-	resp, err := c.vaultClient.Logical().Write(path, data)
-	if err != nil {
-		return fmt.Errorf("failed to start release task: %w", err)
-	}
-
-	taskID, ok := resp.Data["task_uuid"].(string)
-	if !ok {
-		return fmt.Errorf("invalid response from Vault: missing task_uuid")
-	}
-
-	return c.watchTask(projectName, taskID, taskLogger)
+	return c.withBackoffRequest(
+		fmt.Sprintf("%s/release", projectName),
+		map[string]interface{}{"git_tag": gitTag},
+		taskLogger,
+		func(taskID string, taskLogger TaskLogger) error {
+			return c.watchTask(projectName, taskID, taskLogger)
+		},
+	)
 }
 
 // watchTask waits for the task to finish and handles status changes
 func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger) error {
 	taskLogger(taskID, fmt.Sprintf("Started task %s", taskID))
 
-	bo := backoff.NewExponentialBackOff()
-	bo.InitialInterval = 2 * time.Second
-	bo.MaxInterval = 30 * time.Second
-	bo.MaxElapsedTime = 5 * time.Minute
-	bo.Multiplier = 2
-
-	operation := func() error {
+	for {
 		status, reason, err := c.getTaskStatus(projectName, taskID)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to fetch task status for %s: %w", taskID, err)
 		}
 
 		taskLogger(taskID, fmt.Sprintf("Current status of task %s: %s", taskID, status))
 
 		switch status {
-		case "RUNNING":
-			taskLogger(taskID, fmt.Sprintf("Task %s is still running...", taskID))
-			return nil
 		case "FAILED":
 			taskLogger(taskID, fmt.Sprintf("Task %s failed: %s", taskID, reason))
 			_ = c.getTaskLogs(projectName, taskID, taskLogger)
@@ -98,17 +112,9 @@ func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger
 			_ = c.getTaskLogs(projectName, taskID, taskLogger)
 			return nil
 		default:
-			taskLogger(taskID, fmt.Sprintf("Unknown status: %s", status))
-			return nil
+			time.Sleep(2 * time.Second)
 		}
 	}
-
-	err := backoff.Retry(operation, bo)
-	if err != nil {
-		return fmt.Errorf("task %s failed after retries: %w", taskID, err)
-	}
-
-	return nil
 }
 
 // getTaskStatus retrieves the status of the task
