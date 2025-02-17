@@ -17,11 +17,13 @@ type TrdlClient struct {
 
 // NewTrdlClient initializes the Vault client using DefaultConfig
 func NewTrdlClient(vaultToken string) (*TrdlClient, error) {
-	config := api.DefaultConfig()
-
-	if addr := os.Getenv("VAULT_ADDR"); addr != "" {
-		config.Address = addr
+	config := &api.Config{
+		Address: os.Getenv("VAULT_ADDR"),
 	}
+
+	// if addr := os.Getenv("VAULT_ADDR"); addr != "" {
+	// 	config.Address = addr
+	// }
 
 	client, err := api.NewClient(config)
 	if err != nil {
@@ -60,7 +62,15 @@ func (c *TrdlClient) withBackoffRequest(
 		return action(taskID, taskLogger)
 	}
 
-	if err := backoff.Retry(operation, bo); err != nil {
+	err := backoff.RetryNotify(
+		operation,
+		bo,
+		func(err error, duration time.Duration) {
+			taskLogger("INFO", fmt.Sprintf("Retrying %s after %v...", path, duration.Round(time.Minute)))
+		},
+	)
+
+	if err != nil {
 		return fmt.Errorf("%s operation exceeded maximum duration: %w", path, err)
 	}
 
@@ -93,7 +103,7 @@ func (c *TrdlClient) Release(projectName, gitTag string, taskLogger TaskLogger) 
 
 // watchTask waits for the task to finish and handles status changes
 func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger) error {
-	taskLogger(taskID, fmt.Sprintf("Started task %s", taskID))
+	taskLogger(taskID, "Started task")
 
 	for {
 		status, reason, err := c.getTaskStatus(projectName, taskID)
@@ -101,19 +111,16 @@ func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger
 			return fmt.Errorf("failed to fetch task status for %s: %w", taskID, err)
 		}
 
-		taskLogger(taskID, fmt.Sprintf("Current status of task %s: %s", taskID, status))
-
 		switch status {
 		case "FAILED":
-			taskLogger(taskID, fmt.Sprintf("Task %s failed: %s", taskID, reason))
+			taskLogger(taskID, fmt.Sprintf("Task failed: %s", reason))
 			_ = c.getTaskLogs(projectName, taskID, taskLogger)
 			return fmt.Errorf("task %s failed: %s", taskID, reason)
 		case "SUCCEEDED":
 			_ = c.getTaskLogs(projectName, taskID, taskLogger)
 			return nil
-		default:
-			time.Sleep(2 * time.Second)
 		}
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -147,6 +154,5 @@ func (c *TrdlClient) getTaskLogs(projectName, taskID string, taskLogger TaskLogg
 	if !ok || logs == "" {
 		return nil
 	}
-	taskLogger(taskID, logs)
 	return nil
 }
