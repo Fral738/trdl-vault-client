@@ -50,7 +50,7 @@ func (c *TrdlClient) withBackoffRequest(
 	operation := func() error {
 		resp, err := c.vaultClient.Logical().Write(path, data)
 		if err != nil {
-			taskLogger("", fmt.Sprintf("[ERROR] %v", err))
+			taskLogger("ERROR", fmt.Sprintf("%v", err))
 			return err
 		}
 
@@ -114,10 +114,10 @@ func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger
 		switch status {
 		case "FAILED":
 			taskLogger(taskID, fmt.Sprintf("Task failed: %s", reason))
-			_ = c.getTaskLogs(projectName, taskID, taskLogger)
+			_ = c.getTaskLogs(projectName, taskID)
 			return fmt.Errorf("task %s failed: %s", taskID, reason)
 		case "SUCCEEDED":
-			_ = c.getTaskLogs(projectName, taskID, taskLogger)
+			_ = c.getTaskLogs(projectName, taskID)
 			return nil
 		}
 		time.Sleep(2 * time.Second)
@@ -141,7 +141,7 @@ func (c *TrdlClient) getTaskStatus(projectName, taskID string) (string, string, 
 }
 
 // getTaskLogs retrieves the logs of the task
-func (c *TrdlClient) getTaskLogs(projectName, taskID string, taskLogger TaskLogger) error {
+func (c *TrdlClient) getTaskLogs(projectName, taskID string) error {
 	resp, err := c.vaultClient.Logical().Read(fmt.Sprintf("%s/task/%s/log", projectName, taskID))
 	if err != nil {
 		return fmt.Errorf("failed to fetch task logs: %w", err)
