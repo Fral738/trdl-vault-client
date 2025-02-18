@@ -17,13 +17,11 @@ type TrdlClient struct {
 
 // NewTrdlClient initializes the Vault client using DefaultConfig
 func NewTrdlClient(vaultToken string) (*TrdlClient, error) {
-	config := &api.Config{
-		Address: os.Getenv("VAULT_ADDR"),
-	}
+	config := api.DefaultConfig()
 
-	// if addr := os.Getenv("VAULT_ADDR"); addr != "" {
-	// 	config.Address = addr
-	// }
+	if addr := os.Getenv("VAULT_ADDR"); addr != "" {
+		config.Address = addr
+	}
 
 	client, err := api.NewClient(config)
 	if err != nil {
@@ -66,7 +64,7 @@ func (c *TrdlClient) withBackoffRequest(
 		operation,
 		bo,
 		func(err error, duration time.Duration) {
-			taskLogger("INFO", fmt.Sprintf("Retrying %s after %v...", path, duration.Round(time.Minute)))
+			taskLogger("INFO", fmt.Sprintf("Retrying %s after %v...", path, bo.NextBackOff()))
 		},
 	)
 
@@ -114,10 +112,8 @@ func (c *TrdlClient) watchTask(projectName, taskID string, taskLogger TaskLogger
 		switch status {
 		case "FAILED":
 			taskLogger(taskID, fmt.Sprintf("Task failed: %s", reason))
-			_ = c.getTaskLogs(projectName, taskID)
 			return fmt.Errorf("task %s failed: %s", taskID, reason)
 		case "SUCCEEDED":
-			_ = c.getTaskLogs(projectName, taskID)
 			return nil
 		}
 		time.Sleep(2 * time.Second)
@@ -138,21 +134,4 @@ func (c *TrdlClient) getTaskStatus(projectName, taskID string) (string, string, 
 	reason, _ := resp.Data["reason"].(string)
 
 	return status, reason, nil
-}
-
-// getTaskLogs retrieves the logs of the task
-func (c *TrdlClient) getTaskLogs(projectName, taskID string) error {
-	resp, err := c.vaultClient.Logical().Read(fmt.Sprintf("%s/task/%s/log", projectName, taskID))
-	if err != nil {
-		return fmt.Errorf("failed to fetch task logs: %w", err)
-	}
-	if resp == nil || resp.Data == nil {
-		return nil
-	}
-
-	logs, ok := resp.Data["result"].(string)
-	if !ok || logs == "" {
-		return nil
-	}
-	return nil
 }
