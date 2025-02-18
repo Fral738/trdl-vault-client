@@ -17,13 +17,11 @@ type TrdlClient struct {
 
 // NewTrdlClient initializes the Vault client using DefaultConfig
 func NewTrdlClient(vaultToken string) (*TrdlClient, error) {
-	config := &api.Config{
-		Address: os.Getenv("VAULT_ADDR"),
-	}
+	config := api.DefaultConfig()
 
-	// if addr := os.Getenv("VAULT_ADDR"); addr != "" {
-	// 	config.Address = addr
-	// }
+	if addr := os.Getenv("VAULT_ADDR"); addr != "" {
+		config.Address = addr
+	}
 
 	client, err := api.NewClient(config)
 	if err != nil {
@@ -66,7 +64,7 @@ func (c *TrdlClient) withBackoffRequest(
 		operation,
 		bo,
 		func(err error, duration time.Duration) {
-			taskLogger("INFO", fmt.Sprintf("Retrying %s after %v...", path, duration.Round(time.Minute)))
+			taskLogger("INFO", fmt.Sprintf("Retrying %s after %v...", path, bo.NextBackOff()))
 		},
 	)
 
